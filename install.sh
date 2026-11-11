@@ -4,17 +4,26 @@ set +x
 set -euo pipefail
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
-usage() { printf 'Usage: sudo bash install.sh [--config /path/to/dashboard-issued.env]\n'; }
+usage() { printf 'Usage: sudo bash install.sh [--config /path/to/dashboard-issued.env] [--qemu-bundle /path/to/verified.zip]\n'; }
 
 input=
-case "${1:-}" in
-    --help|-h) usage; exit 0 ;;
-    --config) [[ $# == 2 && -n $2 ]] || { usage; exit 2; }; input=$2 ;;
-    '') [[ $# == 0 ]] || { usage; exit 2; } ;;
-    *) usage; exit 2 ;;
-esac
+qemu_bundle=
+while (($#)); do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --config) [[ $# -ge 2 && -n "$2" ]] || { usage; exit 2; }; input=$2; shift 2 ;;
+        --qemu-bundle) [[ $# -ge 2 && -n "$2" ]] || { usage; exit 2; }; qemu_bundle=$2; shift 2 ;;
+        *) usage; exit 2 ;;
+    esac
+done
 (( EUID == 0 )) || die 'Run this installer with sudo.'
 [[ $(dpkg --print-architecture) == amd64 ]] || die 'The customer package requires Ubuntu amd64.'
+# shellcheck source=/dev/null
+. /etc/os-release
+[[ "${ID:-}" == ubuntu && ( "${VERSION_ID:-}" == 24.04 || "${VERSION_ID:-}" == 26.04 ) ]] || die 'This installer supports Ubuntu 24.04 and 26.04 amd64.'
+for tool in curl python3 flock; do
+    command -v "$tool" >/dev/null || die "Install $tool before running the bootstrap."
+done
 for path in /usr/local/bin/netloom-node /etc/netloom/node.env /etc/systemd/system/netloom-node.service /run/systemd/system/netloom-node.service; do
     [[ ! -e $path && ! -L $path ]] || die "Manual installation detected at $path. Use its existing update method."
 done
@@ -139,6 +148,7 @@ PY
 )
 read -r tag digest size <<< "$verified"
 version=${tag#v}
+dpkg --compare-versions "$version" ge 0.9.19-1 || die 'Publish NetLoom Node 0.9.19-1 or later before using this installer.'
 deb=$work/$asset
 download "https://github.com/$repo/releases/download/$tag/$asset" -o "$deb"
 chmod 0644 "$deb"
@@ -157,6 +167,14 @@ if [[ $status != installed || $old_version != "$version" ]]; then
 else
     printf 'NetLoom Node %s is already installed.\n' "$version"
 fi
+
+# Package postinst does not start the node. Verify/install the host runtime before
+# configuring a fresh node or offering the command to start an existing one.
+runtime_helper=/usr/lib/netloom-node/install-qemu-runtime.sh
+[[ -f "$runtime_helper" && ! -L "$runtime_helper" ]] || die 'The selected node package does not contain the reviewed QEMU runtime installer. Publish the updated node release first.'
+runtime_args=(--install)
+if [[ -n "$qemu_bundle" ]]; then runtime_args+=(--bundle "$qemu_bundle"); fi
+bash "$runtime_helper" "${runtime_args[@]}"
 
 # Never overwrite live credentials or operator settings, including on a rerun.
 [[ -f $config && ! -L $config ]] || die "Package installation did not create a regular $config."
@@ -194,3 +212,4 @@ mv -T -- "$env_tmp" "$config"
 env_tmp=
 systemctl enable --now docker.service openvswitch-switch.service netloom-node.service
 printf 'NetLoom Node %s started. Check Online status and image inventory in the dashboard.\n' "$version"
+
